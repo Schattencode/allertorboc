@@ -1,8 +1,16 @@
 import os
 
+from dotenv import load_dotenv
+
+load_dotenv()
+
 # Telegram Configuration
-TELEGRAM_BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN', 'YOUR_BOT_TOKEN_HERE')
-TELEGRAM_CHAT_ID = os.getenv('TELEGRAM_CHAT_ID', 'YOUR_CHAT_ID_HERE')
+TELEGRAM_BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN', '')
+
+# Список Telegram User ID, которые получают алерты
+# В .env указывать через запятую: TELEGRAM_USER_IDS=111111,222222,333333
+_raw_ids = os.getenv('TELEGRAM_USER_IDS', '')
+TELEGRAM_USER_IDS = [uid.strip() for uid in _raw_ids.split(',') if uid.strip()]
 
 # Monitoring Configuration
 CHECK_INTERVAL = 30  # seconds between checks

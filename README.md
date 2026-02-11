@@ -9,34 +9,45 @@
 - 1-2 minute alert latency (30s polling interval)
 - 24-hour rolling memory window
 - Configurable filters (age, market cap, chain, liquidity)
+- Multi-user support — alerts go to all user IDs in `.env`
 - State persistence across restarts (`data/memory.json`)
 - Rotating log files
 
 ## Quick Start
 
 ```bash
-# Install dependencies
+# 1. Install dependencies
 pip install -r requirements.txt
 
-# Configure credentials (edit config.py or set env vars)
-export TELEGRAM_BOT_TOKEN="your_token"
-export TELEGRAM_CHAT_ID="your_chat_id"
+# 2. Create .env file from example
+cp .env.example .env
 
-# Optional: test API access first
+# 3. Edit .env — вписать свой токен и user ID
+nano .env
+
+# 4. (Optional) Test API access
 python test_api.py
 
-# Run
+# 5. Run
 python main.py
 ```
 
 ## Configuration
 
-Edit `config.py` or set environment variables:
+### `.env` file
+
+```env
+# Токен бота (получить у @BotFather)
+TELEGRAM_BOT_TOKEN=123456789:ABCdefGHIjklMNOpqrsTUVwxyz
+
+# Список Telegram User ID через запятую
+# Узнать свой ID: написать боту @userinfobot
+TELEGRAM_USER_IDS=111111111,222222222
+```
+
+### Filters (`config.py`)
 
 ```python
-TELEGRAM_BOT_TOKEN = "your_token"
-TELEGRAM_CHAT_ID = "your_chat_id"
-
 FILTERS = {
     'min_age_minutes': 5,
     'max_age_hours': 24,
@@ -53,7 +64,7 @@ FILTERS = {
 2. New tokens are stored in a 24-hour rolling memory window
 3. When a token adds a Twitter link, fetches market data from `/latest/dex/tokens/{address}`
 4. Applies filters (chain, age, market cap, liquidity)
-5. Sends a formatted Telegram alert
+5. Sends a formatted Telegram alert to all users from `.env`
 6. Prevents duplicate alerts via an `alerted` set persisted to disk
 
 ## Running in Background
@@ -75,4 +86,4 @@ python main.py
 - **No alerts:** Check that filters match the tokens you expect. Review `logs/monitor.log`.
 - **Duplicate alerts:** Inspect `data/memory.json` for corruption.
 - **API errors:** Check logs; DexScreener API may be temporarily down.
-- **Telegram errors:** Verify bot token and chat ID are correct.
+- **Telegram errors:** Verify bot token and user IDs in `.env` are correct.

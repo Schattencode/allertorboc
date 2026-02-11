@@ -27,7 +27,7 @@ from config import (
     LOG_DIR,
     MEMORY_HOURS,
     TELEGRAM_BOT_TOKEN,
-    TELEGRAM_CHAT_ID,
+    TELEGRAM_USER_IDS,
 )
 
 # ---------------------------------------------------------------------------
@@ -371,26 +371,37 @@ def build_alert_message(token_info, alert_type):
 
 
 async def send_telegram_alert(message):
-    """Send a message to the configured Telegram chat. Returns True on success."""
+    """Send a message to every user in TELEGRAM_USER_IDS. Returns True if at least one succeeded."""
+    if not TELEGRAM_USER_IDS:
+        logger.error('No TELEGRAM_USER_IDS configured, cannot send alert')
+        return False
+
     url = f'https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage'
-    payload = {
-        'chat_id': TELEGRAM_CHAT_ID,
-        'text': message,
-        'parse_mode': 'Markdown',
-        'disable_web_page_preview': True,
-    }
+    any_success = False
+
     try:
         async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=15)) as session:
-            async with session.post(url, json=payload) as resp:
-                if resp.status == 200:
-                    logger.info('Alert sent to Telegram')
-                    return True
-                error_text = await resp.text()
-                logger.error('Telegram API error %d: %s', resp.status, error_text)
-                return False
+            for user_id in TELEGRAM_USER_IDS:
+                payload = {
+                    'chat_id': user_id,
+                    'text': message,
+                    'parse_mode': 'Markdown',
+                    'disable_web_page_preview': True,
+                }
+                try:
+                    async with session.post(url, json=payload) as resp:
+                        if resp.status == 200:
+                            logger.info('Alert sent to user %s', user_id)
+                            any_success = True
+                        else:
+                            error_text = await resp.text()
+                            logger.error('Telegram error for user %s (%d): %s', user_id, resp.status, error_text)
+                except Exception as exc:
+                    logger.error('Failed to send alert to user %s: %s', user_id, exc)
     except Exception as exc:
-        logger.error('Failed to send Telegram alert: %s', exc)
-        return False
+        logger.error('Telegram session error: %s', exc)
+
+    return any_success
 
 # ---------------------------------------------------------------------------
 # Token info builder
@@ -587,13 +598,15 @@ async def main():
 # ---------------------------------------------------------------------------
 
 if __name__ == '__main__':
-    if not TELEGRAM_BOT_TOKEN or 'YOUR_BOT_TOKEN' in TELEGRAM_BOT_TOKEN:
-        logger.error('Please configure TELEGRAM_BOT_TOKEN in config.py or as an env var!')
+    if not TELEGRAM_BOT_TOKEN:
+        logger.error('TELEGRAM_BOT_TOKEN not set! Add it to .env file.')
         sys.exit(1)
 
-    if not TELEGRAM_CHAT_ID or 'YOUR_CHAT_ID' in TELEGRAM_CHAT_ID:
-        logger.error('Please configure TELEGRAM_CHAT_ID in config.py or as an env var!')
+    if not TELEGRAM_USER_IDS:
+        logger.error('TELEGRAM_USER_IDS not set! Add user IDs to .env file.')
         sys.exit(1)
+
+    logger.info('Sending alerts to %d user(s): %s', len(TELEGRAM_USER_IDS), ', '.join(TELEGRAM_USER_IDS))
 
     try:
         asyncio.run(main())
