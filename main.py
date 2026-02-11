@@ -105,6 +105,23 @@ def format_delay(first_seen_iso, twitter_added_iso):
     minutes = int((delay.total_seconds() % 3600) / 60)
     return f'{hours}h {minutes}m'
 
+
+def extract_twitter_from_pairs(token_data):
+    """Extract Twitter URL from token/pair data (info.socials field)."""
+    if not token_data or not token_data.get('pairs'):
+        return None
+    pair = token_data['pairs'][0]
+    info = pair.get('info') or {}
+    socials = info.get('socials') or []
+    for social in socials:
+        stype = (social.get('type') or '').lower()
+        url = social.get('url', '')
+        if stype == 'twitter':
+            return url
+        if 'twitter.com' in url or 'x.com' in url:
+            return url
+    return None
+
 # ---------------------------------------------------------------------------
 # Live Filters (mutable at runtime, persisted to disk)
 # ---------------------------------------------------------------------------
@@ -519,6 +536,83 @@ async def _send_alert(token_info, alert_type, memory):
         memory.save_to_disk()
 
 # ---------------------------------------------------------------------------
+# Background re-check: tokens in memory without Twitter
+# ---------------------------------------------------------------------------
+
+RECHECK_INTERVAL = 120  # seconds between re-check cycles
+RECHECK_DELAY = 1       # seconds between individual token checks (rate limit)
+
+
+async def recheck_loop(api, memory, token_filter):
+    """Periodically re-check tokens in memory that don't have Twitter yet."""
+    logger.info('Background re-check loop started (every %ds)', RECHECK_INTERVAL)
+
+    while True:
+        await asyncio.sleep(RECHECK_INTERVAL)
+
+        try:
+            no_twitter = [
+                addr for addr, info in memory.tokens.items()
+                if info.get('twitter_url') is None and addr not in memory.alerted
+            ]
+
+            if not no_twitter:
+                logger.debug('Re-check: all tokens in memory already have Twitter or were alerted')
+                continue
+
+            logger.info('Re-checking %d token(s) without Twitter...', len(no_twitter))
+
+            found = 0
+            for address in no_twitter:
+                try:
+                    token_data = await api.get_token_data(address)
+                    if not token_data:
+                        continue
+
+                    twitter_url = extract_twitter_from_pairs(token_data)
+                    if not twitter_url:
+                        await asyncio.sleep(RECHECK_DELAY)
+                        continue
+
+                    # Twitter was found!
+                    logger.info('Re-check: Twitter found for %s!', address[:12])
+                    found += 1
+
+                    passes, reason = token_filter.check(token_data)
+                    if not passes:
+                        logger.info('Token %s no longer passes filters: %s', address[:12], reason)
+                        memory.update_token(address, {
+                            'twitter_url': twitter_url,
+                            'last_checked': datetime.now(timezone.utc).isoformat(),
+                        })
+                        continue
+
+                    pair = token_data['pairs'][0] if token_data.get('pairs') else {}
+                    memory.update_token(address, {
+                        'twitter_url': twitter_url,
+                        'twitter_added_at': datetime.now(timezone.utc).isoformat(),
+                        'last_checked': datetime.now(timezone.utc).isoformat(),
+                        'market_cap': pair.get('fdv') or pair.get('marketCap') or 0,
+                        'liquidity_usd': (pair.get('liquidity') or {}).get('usd', 0) or 0,
+                        'price_usd': float(pair.get('priceUsd', 0) or 0),
+                    })
+
+                    updated_info = memory.get_token(address)
+                    await _send_alert(updated_info, 'TWITTER_ADDED', memory)
+                    await asyncio.sleep(RECHECK_DELAY)
+
+                except Exception as exc:
+                    logger.error('Re-check error for %s: %s', address[:12], exc)
+
+            if found:
+                logger.info('Re-check done: found Twitter for %d token(s)', found)
+
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.error('Re-check loop error: %s', exc)
+
+# ---------------------------------------------------------------------------
 # Telegram Command Handler
 # ---------------------------------------------------------------------------
 
@@ -780,10 +874,11 @@ async def main():
         for uid in TELEGRAM_USER_IDS:
             await _tg_send(uid, startup_msg, session)
 
-    # Run monitor + command listener concurrently
+    # Run monitor + command listener + background re-check concurrently
     await asyncio.gather(
         monitor_loop(api, memory, token_filter),
         cmd_handler.poll_updates(),
+        recheck_loop(api, memory, token_filter),
     )
 
 # ---------------------------------------------------------------------------
