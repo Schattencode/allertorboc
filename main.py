@@ -3,6 +3,7 @@
 DexScreener Twitter Monitor
 24/7 bot that monitors tokens with PAID DexScreener Enhanced Token Info
 and sends Telegram alerts when they add Twitter/X links.
+Includes interactive Telegram commands for filter management.
 """
 
 import asyncio
@@ -41,7 +42,6 @@ def setup_logging():
     logger = logging.getLogger('dexscreener_monitor')
     logger.setLevel(logging.DEBUG)
 
-    # Console handler
     console = logging.StreamHandler()
     console.setLevel(logging.INFO)
     console.setFormatter(logging.Formatter(
@@ -49,7 +49,6 @@ def setup_logging():
         datefmt='%H:%M:%S',
     ))
 
-    # File handler (rotating, 10 MB, 5 backups)
     file_handler = RotatingFileHandler(
         os.path.join(LOG_DIR, 'monitor.log'),
         maxBytes=10 * 1024 * 1024,
@@ -73,12 +72,7 @@ logger = setup_logging()
 # ---------------------------------------------------------------------------
 
 def extract_twitter_url(profile):
-    """
-    Extract Twitter/X URL from a token profile's links array.
-
-    Checks for type == "twitter" first, then falls back to URL matching.
-    Returns the URL string or None.
-    """
+    """Extract Twitter/X URL from a token profile's links array."""
     links = profile.get('links') or []
     for link in links:
         link_type = (link.get('type') or '').lower()
@@ -112,6 +106,40 @@ def format_delay(first_seen_iso, twitter_added_iso):
     return f'{hours}h {minutes}m'
 
 # ---------------------------------------------------------------------------
+# Live Filters (mutable at runtime, persisted to disk)
+# ---------------------------------------------------------------------------
+
+FILTERS_FILE = os.path.join(DATA_DIR, 'filters.json')
+
+
+def load_filters():
+    """Load filters from disk, falling back to config.py defaults."""
+    try:
+        if os.path.exists(FILTERS_FILE):
+            with open(FILTERS_FILE, 'r') as f:
+                saved = json.load(f)
+            logger.info('Loaded filters from disk: %s', saved)
+            return saved
+    except Exception as exc:
+        logger.error('Failed to load filters: %s', exc)
+    return dict(FILTERS)
+
+
+def save_filters(filters):
+    """Persist current filters to disk."""
+    try:
+        os.makedirs(DATA_DIR, exist_ok=True)
+        with open(FILTERS_FILE, 'w') as f:
+            json.dump(filters, f, indent=2)
+        logger.info('Filters saved to disk')
+    except Exception as exc:
+        logger.error('Failed to save filters: %s', exc)
+
+
+# Global mutable filters dict — shared between monitor and command handler
+live_filters = load_filters()
+
+# ---------------------------------------------------------------------------
 # Token Filter
 # ---------------------------------------------------------------------------
 
@@ -122,45 +150,30 @@ class TokenFilter:
         self.config = config
 
     def check(self, token_data):
-        """
-        Check whether a token passes all filters.
-
-        Args:
-            token_data: Raw response from /latest/dex/tokens/{address}
-
-        Returns:
-            (passes: bool, reason: str)
-        """
         if not token_data or 'pairs' not in token_data or not token_data['pairs']:
             return False, 'No pair data available'
 
         pair = token_data['pairs'][0]
 
-        # Chain filter
         chain_id = pair.get('chainId', '')
         if chain_id not in self.config['chains']:
             return False, f'Chain {chain_id} not in whitelist'
 
-        # Age filter
         pair_created = pair.get('pairCreatedAt')
         if pair_created:
             age_minutes = (time.time() * 1000 - pair_created) / 1000 / 60
-
             if age_minutes < self.config['min_age_minutes']:
                 return False, f'Too young: {age_minutes:.1f} minutes'
-
             age_hours = age_minutes / 60
             if age_hours > self.config['max_age_hours']:
                 return False, f'Too old: {age_hours:.1f} hours'
 
-        # Market cap filter
         mcap = pair.get('fdv') or pair.get('marketCap') or 0
         if mcap < self.config['min_mcap']:
             return False, f'Market cap too low: ${mcap:,.0f}'
         if mcap > self.config['max_mcap']:
             return False, f'Market cap too high: ${mcap:,.0f}'
 
-        # Liquidity filter
         liquidity = (pair.get('liquidity') or {}).get('usd', 0) or 0
         min_liq = self.config.get('min_liquidity', 0)
         if liquidity < min_liq:
@@ -183,10 +196,6 @@ class DexScreenerAPI:
         self.max_failures = API_MAX_CONSECUTIVE_FAILURES
 
     async def get_token_profiles(self):
-        """
-        Fetch the latest paid token profiles.
-        Returns a list of profile dicts, or None on failure.
-        """
         try:
             async with aiohttp.ClientSession(timeout=self.timeout) as session:
                 async with session.get(self.profiles_url) as resp:
@@ -213,10 +222,6 @@ class DexScreenerAPI:
             return None
 
     async def get_token_data(self, token_address):
-        """
-        Fetch detailed token/pair data for a specific address.
-        Returns the parsed JSON dict, or None on failure.
-        """
         url = f'{self.tokens_url}/{token_address}'
         try:
             async with aiohttp.ClientSession(timeout=self.timeout) as session:
@@ -233,7 +238,6 @@ class DexScreenerAPI:
             return None
 
     def is_healthy(self):
-        """Return False if too many consecutive failures have occurred."""
         if self.consecutive_failures >= self.max_failures:
             logger.critical('Too many consecutive API failures (%d)!', self.consecutive_failures)
             return False
@@ -249,11 +253,9 @@ class TokenMemory:
     def __init__(self, data_dir=DATA_DIR, memory_hours=MEMORY_HOURS):
         self.data_dir = data_dir
         self.memory_hours = memory_hours
-        self.tokens = {}       # {tokenAddress: dict}
-        self.alerted = set()   # set of tokenAddress strings
+        self.tokens = {}
+        self.alerted = set()
         self.load_from_disk()
-
-    # -- CRUD ---------------------------------------------------------------
 
     def add_token(self, token_info):
         self.tokens[token_info['tokenAddress']] = token_info
@@ -268,10 +270,7 @@ class TokenMemory:
     def has_token(self, address):
         return address in self.tokens
 
-    # -- Cleanup ------------------------------------------------------------
-
     def cleanup_old(self):
-        """Remove tokens whose first_seen is older than the memory window."""
         cutoff = datetime.now(timezone.utc) - timedelta(hours=self.memory_hours)
         to_remove = []
         for address, token in self.tokens.items():
@@ -281,18 +280,13 @@ class TokenMemory:
                     to_remove.append(address)
             except (KeyError, ValueError):
                 to_remove.append(address)
-
         for address in to_remove:
             del self.tokens[address]
             self.alerted.discard(address)
-
         if to_remove:
             logger.info('Cleaned up %d token(s) older than %dh', len(to_remove), self.memory_hours)
 
-    # -- Persistence --------------------------------------------------------
-
     def save_to_disk(self):
-        """Atomically persist state to data/memory.json."""
         try:
             os.makedirs(self.data_dir, exist_ok=True)
             state = {
@@ -310,7 +304,6 @@ class TokenMemory:
             logger.error('Failed to save memory: %s', exc)
 
     def load_from_disk(self):
-        """Load state from data/memory.json if it exists."""
         path = os.path.join(self.data_dir, 'memory.json')
         try:
             if not os.path.exists(path):
@@ -327,11 +320,31 @@ class TokenMemory:
             logger.warning('Starting with empty memory')
 
 # ---------------------------------------------------------------------------
-# Telegram alerts
+# Telegram: send message helper
+# ---------------------------------------------------------------------------
+
+async def _tg_send(chat_id, text, session):
+    """Send a single Telegram message."""
+    url = f'https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage'
+    payload = {
+        'chat_id': chat_id,
+        'text': text,
+        'parse_mode': 'Markdown',
+        'disable_web_page_preview': True,
+    }
+    try:
+        async with session.post(url, json=payload) as resp:
+            if resp.status != 200:
+                err = await resp.text()
+                logger.error('Telegram send error for %s (%d): %s', chat_id, resp.status, err)
+    except Exception as exc:
+        logger.error('Telegram send failed for %s: %s', chat_id, exc)
+
+# ---------------------------------------------------------------------------
+# Telegram alerts (broadcast to all users)
 # ---------------------------------------------------------------------------
 
 def build_alert_message(token_info, alert_type):
-    """Build a Markdown-formatted Telegram alert message."""
     symbol = token_info.get('symbol', '???')
     name = token_info.get('name', 'Unknown')
     chain = token_info.get('chainId', 'unknown').upper()
@@ -371,17 +384,16 @@ def build_alert_message(token_info, alert_type):
 
 
 async def send_telegram_alert(message):
-    """Send a message to every user in TELEGRAM_USER_IDS. Returns True if at least one succeeded."""
+    """Broadcast alert to all users. Returns True if at least one succeeded."""
     if not TELEGRAM_USER_IDS:
-        logger.error('No TELEGRAM_USER_IDS configured, cannot send alert')
+        logger.error('No TELEGRAM_USER_IDS configured')
         return False
 
-    url = f'https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage'
     any_success = False
-
     try:
         async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=15)) as session:
             for user_id in TELEGRAM_USER_IDS:
+                url = f'https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage'
                 payload = {
                     'chat_id': user_id,
                     'text': message,
@@ -394,13 +406,12 @@ async def send_telegram_alert(message):
                             logger.info('Alert sent to user %s', user_id)
                             any_success = True
                         else:
-                            error_text = await resp.text()
-                            logger.error('Telegram error for user %s (%d): %s', user_id, resp.status, error_text)
+                            err = await resp.text()
+                            logger.error('Telegram error for user %s (%d): %s', user_id, resp.status, err)
                 except Exception as exc:
                     logger.error('Failed to send alert to user %s: %s', user_id, exc)
     except Exception as exc:
         logger.error('Telegram session error: %s', exc)
-
     return any_success
 
 # ---------------------------------------------------------------------------
@@ -408,12 +419,8 @@ async def send_telegram_alert(message):
 # ---------------------------------------------------------------------------
 
 def build_token_info(profile, token_data, twitter_url):
-    """
-    Construct a token_info dict from a profile response and token data response.
-    """
     pair = token_data['pairs'][0] if token_data.get('pairs') else {}
     now_iso = datetime.now(timezone.utc).isoformat()
-
     return {
         'tokenAddress': profile.get('tokenAddress', ''),
         'chainId': profile.get('chainId', ''),
@@ -421,20 +428,12 @@ def build_token_info(profile, token_data, twitter_url):
         'name': pair.get('baseToken', {}).get('name', 'Unknown'),
         'pairAddress': pair.get('pairAddress', ''),
         'pairCreatedAt': pair.get('pairCreatedAt', 0),
-
-        # DexScreener payment tracking
         'first_seen': now_iso,
         'dex_paid': True,
-
-        # Twitter tracking
         'twitter_url': twitter_url,
         'twitter_added_at': now_iso if twitter_url else None,
         'had_twitter_initially': twitter_url is not None,
-
-        # Timestamps
         'last_checked': now_iso,
-
-        # Market data
         'market_cap': pair.get('fdv') or pair.get('marketCap') or 0,
         'liquidity_usd': (pair.get('liquidity') or {}).get('usd', 0) or 0,
         'price_usd': float(pair.get('priceUsd', 0) or 0),
@@ -444,8 +443,7 @@ def build_token_info(profile, token_data, twitter_url):
 # Core processing logic
 # ---------------------------------------------------------------------------
 
-async def process_profile(profile, api, memory, filters):
-    """Process a single token profile from the profiles API."""
+async def process_profile(profile, api, memory, token_filter):
     token_address = profile.get('tokenAddress')
     if not token_address:
         return
@@ -453,13 +451,12 @@ async def process_profile(profile, api, memory, filters):
     twitter_url = extract_twitter_url(profile)
 
     if not memory.has_token(token_address):
-        # ---- NEW TOKEN ----
         token_data = await api.get_token_data(token_address)
         if not token_data:
             logger.error('Failed to fetch token data for %s', token_address[:12])
             return
 
-        passes, reason = filters.check(token_data)
+        passes, reason = token_filter.check(token_data)
         if not passes:
             logger.info('Token %s filtered out: %s', token_address[:12], reason)
             return
@@ -472,17 +469,14 @@ async def process_profile(profile, api, memory, filters):
         else:
             logger.info('New paid token saved (no Twitter yet): %s', token_address[:12])
     else:
-        # ---- EXISTING TOKEN ----
         existing = memory.get_token(token_address)
         had_twitter = existing.get('twitter_url') is not None
         has_twitter = twitter_url is not None
 
         if not had_twitter and has_twitter:
-            # Twitter was just added!
             token_data = await api.get_token_data(token_address)
-
             if token_data:
-                passes, reason = filters.check(token_data)
+                passes, reason = token_filter.check(token_data)
                 if not passes:
                     logger.info('Token %s no longer passes filters: %s', token_address[:12], reason)
                     memory.update_token(token_address, {
@@ -490,7 +484,6 @@ async def process_profile(profile, api, memory, filters):
                         'twitter_url': twitter_url,
                     })
                     return
-
                 pair = token_data['pairs'][0] if token_data.get('pairs') else {}
                 memory.update_token(token_address, {
                     'twitter_url': twitter_url,
@@ -501,29 +494,24 @@ async def process_profile(profile, api, memory, filters):
                     'price_usd': float(pair.get('priceUsd', 0) or 0),
                 })
             else:
-                # Couldn't fetch fresh data — still record the Twitter URL
                 memory.update_token(token_address, {
                     'twitter_url': twitter_url,
                     'twitter_added_at': datetime.now(timezone.utc).isoformat(),
                     'last_checked': datetime.now(timezone.utc).isoformat(),
                 })
-
             updated_info = memory.get_token(token_address)
             await _send_alert(updated_info, 'TWITTER_ADDED', memory)
         else:
-            # No relevant change
             memory.update_token(token_address, {
                 'last_checked': datetime.now(timezone.utc).isoformat(),
             })
 
 
 async def _send_alert(token_info, alert_type, memory):
-    """Send an alert if one hasn't already been sent for this token."""
     address = token_info['tokenAddress']
     if address in memory.alerted:
         logger.warning('Alert already sent for %s, skipping', address[:12])
         return
-
     message = build_alert_message(token_info, alert_type)
     success = await send_telegram_alert(message)
     if success:
@@ -531,21 +519,194 @@ async def _send_alert(token_info, alert_type, memory):
         memory.save_to_disk()
 
 # ---------------------------------------------------------------------------
-# Main loop
+# Telegram Command Handler
 # ---------------------------------------------------------------------------
 
-async def main():
-    """Main monitoring loop."""
-    logger.info('DexScreener Twitter Monitor starting...')
-    logger.info('Filters: %s', FILTERS)
-    logger.info('Check interval: %ds', CHECK_INTERVAL)
+class TelegramCommandHandler:
+    """Listens for Telegram commands via getUpdates and handles them."""
 
-    api = DexScreenerAPI()
-    memory = TokenMemory()
-    token_filter = TokenFilter(FILTERS)
+    def __init__(self, memory):
+        self.memory = memory
+        self.last_update_id = 0
+        self.start_time = datetime.now(timezone.utc)
 
+    def _is_authorized(self, user_id):
+        return str(user_id) in TELEGRAM_USER_IDS
+
+    def _format_settings(self):
+        f = live_filters
+        chains = ', '.join(f.get('chains', []))
+        return (
+            '⚙️ *Текущие настройки фильтров:*\n\n'
+            f'💰 Min Market Cap: `${f["min_mcap"]:,.0f}`\n'
+            f'💰 Max Market Cap: `${f["max_mcap"]:,.0f}`\n'
+            f'💧 Min Liquidity: `${f.get("min_liquidity", 0):,.0f}`\n'
+            f'⏰ Min Age: `{f["min_age_minutes"]} мин`\n'
+            f'⏰ Max Age: `{f["max_age_hours"]} ч`\n'
+            f'🔗 Chains: `{chains}`\n'
+            f'🧠 Memory: `{self.memory.memory_hours} ч`'
+        )
+
+    def _format_help(self):
+        return (
+            '🤖 *DexScreener Twitter Monitor*\n\n'
+            'Бот отслеживает токены с оплаченным DexScreener '
+            'и шлёт алерт когда добавляют Twitter.\n\n'
+            '*Команды:*\n'
+            '/settings — текущие фильтры\n'
+            '/status — статус бота\n'
+            '/set\\_min\\_mcap `число` — мин. маркеткэп\n'
+            '/set\\_max\\_mcap `число` — макс. маркеткэп\n'
+            '/set\\_min\\_liq `число` — мин. ликвидность\n'
+            '/set\\_min\\_age `минуты` — мин. возраст токена\n'
+            '/set\\_max\\_age `часы` — макс. возраст токена\n'
+            '/set\\_chains `chain1,chain2` — сети\n'
+            '/set\\_memory `часы` — окно памяти\n'
+            '/reset — сбросить фильтры по умолчанию'
+        )
+
+    async def handle_command(self, text, chat_id, session):
+        """Parse and execute a command, reply to chat_id."""
+        text = text.strip()
+        cmd_parts = text.split(maxsplit=1)
+        cmd = cmd_parts[0].lower().split('@')[0]  # strip @botname
+        arg = cmd_parts[1].strip() if len(cmd_parts) > 1 else ''
+
+        if cmd == '/start' or cmd == '/help':
+            reply = self._format_help()
+            await _tg_send(chat_id, reply, session)
+            await _tg_send(chat_id, self._format_settings(), session)
+            return
+
+        if cmd == '/settings':
+            await _tg_send(chat_id, self._format_settings(), session)
+            return
+
+        if cmd == '/status':
+            uptime = datetime.now(timezone.utc) - self.start_time
+            h = int(uptime.total_seconds() // 3600)
+            m = int((uptime.total_seconds() % 3600) // 60)
+            reply = (
+                '📊 *Статус бота:*\n\n'
+                f'⏱ Аптайм: `{h}ч {m}м`\n'
+                f'🧠 Токенов в памяти: `{len(self.memory.tokens)}`\n'
+                f'📨 Алертов отправлено: `{len(self.memory.alerted)}`\n'
+                f'👥 Пользователей: `{len(TELEGRAM_USER_IDS)}`'
+            )
+            await _tg_send(chat_id, reply, session)
+            return
+
+        if cmd == '/reset':
+            live_filters.clear()
+            live_filters.update(FILTERS)
+            save_filters(live_filters)
+            await _tg_send(chat_id, '✅ Фильтры сброшены по умолчанию.', session)
+            await _tg_send(chat_id, self._format_settings(), session)
+            return
+
+        # --- Set commands ---
+        setter_map = {
+            '/set_min_mcap':  ('min_mcap', float, '💰 Min Market Cap'),
+            '/set_max_mcap':  ('max_mcap', float, '💰 Max Market Cap'),
+            '/set_min_liq':   ('min_liquidity', float, '💧 Min Liquidity'),
+            '/set_min_age':   ('min_age_minutes', float, '⏰ Min Age (мин)'),
+            '/set_max_age':   ('max_age_hours', float, '⏰ Max Age (ч)'),
+            '/set_memory':    ('__memory__', int, '🧠 Memory (ч)'),
+        }
+
+        if cmd in setter_map:
+            key, typ, label = setter_map[cmd]
+            if not arg:
+                await _tg_send(chat_id, f'❌ Укажи значение.\nПример: `{cmd} 50000`', session)
+                return
+            try:
+                value = typ(arg.replace(',', '').replace('_', ''))
+            except ValueError:
+                await _tg_send(chat_id, f'❌ Неверное число: `{arg}`', session)
+                return
+
+            if key == '__memory__':
+                self.memory.memory_hours = int(value)
+                # Also save in filters file for persistence
+                live_filters['__memory_hours__'] = int(value)
+            else:
+                live_filters[key] = value
+
+            save_filters(live_filters)
+            await _tg_send(chat_id, f'✅ {label} = `{value}`', session)
+            await _tg_send(chat_id, self._format_settings(), session)
+            return
+
+        if cmd == '/set_chains':
+            if not arg:
+                await _tg_send(chat_id, '❌ Укажи сети через запятую.\nПример: `/set_chains solana,base`', session)
+                return
+            chains = [c.strip().lower() for c in arg.split(',') if c.strip()]
+            if not chains:
+                await _tg_send(chat_id, '❌ Пустой список сетей.', session)
+                return
+            live_filters['chains'] = chains
+            save_filters(live_filters)
+            await _tg_send(chat_id, f'✅ Chains = `{", ".join(chains)}`', session)
+            await _tg_send(chat_id, self._format_settings(), session)
+            return
+
+        # Unknown command
+        await _tg_send(chat_id, '❓ Неизвестная команда. Отправь /help для списка команд.', session)
+
+    async def poll_updates(self):
+        """Long-poll Telegram getUpdates in a loop."""
+        logger.info('Telegram command listener started')
+        url = f'https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates'
+
+        while True:
+            try:
+                params = {
+                    'offset': self.last_update_id + 1,
+                    'timeout': 30,
+                }
+                async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=45)) as session:
+                    async with session.get(url, params=params) as resp:
+                        if resp.status != 200:
+                            logger.error('getUpdates returned %d', resp.status)
+                            await asyncio.sleep(5)
+                            continue
+                        data = await resp.json()
+
+                    if not data.get('ok'):
+                        await asyncio.sleep(5)
+                        continue
+
+                    for update in data.get('result', []):
+                        self.last_update_id = update['update_id']
+                        msg = update.get('message')
+                        if not msg:
+                            continue
+                        text = msg.get('text', '')
+                        if not text.startswith('/'):
+                            continue
+                        user_id = msg.get('from', {}).get('id')
+                        chat_id = msg['chat']['id']
+
+                        if not self._is_authorized(user_id):
+                            await _tg_send(chat_id, '⛔ У тебя нет доступа к этому боту.', session)
+                            continue
+
+                        await self.handle_command(text, chat_id, session)
+
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.error('Telegram poll error: %s', exc)
+                await asyncio.sleep(5)
+
+# ---------------------------------------------------------------------------
+# Monitor loop
+# ---------------------------------------------------------------------------
+
+async def monitor_loop(api, memory, token_filter):
+    """Main DexScreener monitoring loop."""
     iteration = 0
-
     while True:
         try:
             iteration += 1
@@ -556,7 +717,6 @@ async def main():
             if not api.is_healthy():
                 logger.critical('API unhealthy, pausing for 5 minutes...')
                 await asyncio.sleep(300)
-                # Reset counter so we try again
                 api.consecutive_failures = 0
                 continue
 
@@ -576,22 +736,55 @@ async def main():
                     logger.error('Error processing profile %s: %s',
                                  profile.get('tokenAddress', '?')[:12], exc, exc_info=True)
 
-            # Cleanup old tokens
             memory.cleanup_old()
 
-            # Periodic save (every 10 iterations ≈ 5 minutes)
             if iteration % 10 == 0:
                 memory.save_to_disk()
 
             logger.info('Memory: %d token(s), %d alerted', len(memory.tokens), len(memory.alerted))
-
             await asyncio.sleep(CHECK_INTERVAL)
 
-        except KeyboardInterrupt:
+        except asyncio.CancelledError:
             raise
         except Exception as exc:
-            logger.error('Unexpected error in main loop: %s', exc, exc_info=True)
+            logger.error('Unexpected error in monitor loop: %s', exc, exc_info=True)
             await asyncio.sleep(CHECK_INTERVAL)
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+async def main():
+    logger.info('DexScreener Twitter Monitor starting...')
+    logger.info('Filters: %s', live_filters)
+    logger.info('Check interval: %ds', CHECK_INTERVAL)
+
+    api = DexScreenerAPI()
+    memory = TokenMemory()
+
+    # Restore memory hours from saved filters
+    saved_mem_hours = live_filters.get('__memory_hours__')
+    if saved_mem_hours:
+        memory.memory_hours = saved_mem_hours
+
+    token_filter = TokenFilter(live_filters)
+    cmd_handler = TelegramCommandHandler(memory)
+
+    # Send startup message to all users
+    startup_msg = (
+        '🚀 *Бот запущен!*\n\n'
+        'Отправь /help чтобы увидеть команды.\n'
+        'Отправь /settings чтобы увидеть текущие фильтры.'
+    )
+    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=15)) as session:
+        for uid in TELEGRAM_USER_IDS:
+            await _tg_send(uid, startup_msg, session)
+
+    # Run monitor + command listener concurrently
+    await asyncio.gather(
+        monitor_loop(api, memory, token_filter),
+        cmd_handler.poll_updates(),
+    )
 
 # ---------------------------------------------------------------------------
 # Entry point
